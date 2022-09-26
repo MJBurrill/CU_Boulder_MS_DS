@@ -1,0 +1,216 @@
+---
+title: "NYPD Shooting Incident Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+# library packages
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(mltools)
+
+```
+
+### Reading in and exploring data:
+
+```{r}
+#read in data from reproducible pathway
+raw_data = fread('data/NYPD_Shooting_Incident_Data__Historic_.csv')
+head(raw_data)
+```
+
+### Summary of the raw data:
+
+```{r}
+summary(raw_data)
+```
+
+### Summary of columns of interest:
+
+```{r}
+table(raw_data$STATISTICAL_MURDER_FLAG)
+```
+
+```{r}
+table(raw_data$PERP_RACE)
+
+```
+
+Noteworthy that there are both null and 'UNKNOWN' Values in PERP_RACE.
+
+```{r}
+table(raw_data$BORO)
+
+```
+
+##### Is INCIDENT_KEY the primary key?
+
+```{r}
+#number of rows in raw data:
+print(nrow(raw_data))
+#number of unique INCIDENT_KEY
+ind_key = raw_data[,.(INCIDENT_KEY)]
+ind_key = distinct(ind_key)
+print(nrow(ind_key))
+```
+
+Answer: No, INCIDENT_KEY is not the primary key. one INCIDENT_KEY can be seen on more than one record.
+
+## Where are there the most murders?
+
+```{r}
+#create a data table that only contains incidents that had a murder.
+murders_only = raw_data[STATISTICAL_MURDER_FLAG == TRUE]
+
+#since we know counting the lines would not be the distinct count of incidents, we need to handle that.
+murders_only = murders_only[,.(INCIDENT_KEY, OCCUR_DATE, BORO) ]
+murders_only = distinct(murders_only)
+
+#graph
+ggplot(murders_only, aes(x=factor(BORO)))+
+  geom_bar(stat="count", width=0.7, fill="steelblue")+
+  theme_minimal() + ggtitle("Count of Murders by BORO") +
+  xlab("BORO") + ylab("Count")
+```
+
+Looks like the most murders occur in Brooklyn and the Bronx in total, but I wonder what the results will show if we look at this over time.
+
+## Murders over time by BORO:
+
+```{r}
+
+# OCCUR_DATE was read in as a character, so we will need convert it to a date format so that we can graph it. 
+murder_over_time = raw_data[STATISTICAL_MURDER_FLAG == TRUE]
+murder_over_time[,date:= as.Date(OCCUR_DATE, format = "%m/%d/%Y")]
+murder_over_time[,year_month:= format(as.Date(date), "%Y-%m")]
+
+
+# now I will want to create a column that is a running total of incidents by BORO and year_month:
+#limit columns to the ones we need and get distinct records:
+murder_over_time_distinct = murder_over_time[,.(INCIDENT_KEY, year_month, BORO) ]
+murder_over_time_distinct = distinct(murder_over_time_distinct)
+
+#create count column and get distinct records:
+setorder(murder_over_time_distinct, BORO,year_month)
+murder_over_time_distinct[,count_of_murder_per_month:= .N, by = .( BORO, year_month)]
+murder_over_time_distinct = murder_over_time_distinct[,.(BORO,year_month,count_of_murder_per_month) ]
+murder_over_time_distinct = distinct(murder_over_time_distinct)
+
+# cumulative sum (running total): 
+setorder(murder_over_time_distinct, BORO,year_month)
+murder_over_time_distinct[,running_total:= cumsum(count_of_murder_per_month), by = .( BORO)]
+
+#line plot:
+ggplot(murder_over_time_distinct, aes(x= year_month, y=running_total, group=BORO, color=BORO)) +
+  geom_line()  + scale_x_discrete(breaks = c('2006-01','2010-01','2014-01','2018-01','2021-12')) + ggtitle("Murders by BORO Over Time")
+
+```
+
+In the end the results from graphing the murders over time is pretty similar to the bar graph. There does seem to be instances where the rate of murders increases.
+
+## Can we predict if an incident results in a murder?
+
+STATISTICAL_MURDER_FLAG will be the response that is going to be predicted.
+
+I selected features mostly based on that they didn't have many null values.
+
+```{r}
+#limit data set to columns that will be made into features.
+features = raw_data[,.(OCCUR_DATE, BORO, VIC_RACE, VIC_SEX, STATISTICAL_MURDER_FLAG) ]
+
+#create date type col and remove OCCUR_DATE:
+features[,date:= as.Date(OCCUR_DATE, format = "%m/%d/%Y")]
+features[,OCCUR_DATE:=NULL]
+
+#convert the columns that need to be one hot encoded into factors:
+features$BORO <- as.factor(features$BORO)
+features$VIC_RACE <- as.factor(features$VIC_RACE)
+features$VIC_SEX <- as.factor(features$VIC_SEX)
+
+# One hot encode:
+features_ohe = one_hot(as.data.table(features))
+features_ohe = distinct(features_ohe)
+
+#fill null values with 0:
+features_ohe[is.na(features_ohe)] = 0
+
+
+# split data into training and testing data by date. 
+train  = features_ohe[ date < '2021-01-01']
+test  = features_ohe[ date >= '2021-01-01']
+
+#remove date from train and test data tables:
+train[,date:=NULL]
+test[,date:=NULL]
+
+```
+
+Now training the model and looking at the some results from training!
+
+```{r}
+model <- glm(STATISTICAL_MURDER_FLAG ~.,family=binomial(link='logit'),data=train)
+summary(model)
+```
+
+Test the model trained above on hold out data.
+
+```{r}
+# Use the model on the test set.
+fitted.results <- predict(model,newdata=subset(test,select=c(1:15)),type='response')
+
+# Use 0.5 as the cutoff probability 
+binarized_results <- ifelse(fitted.results > 0.5,1,0)
+misClasificError <- mean(binarized_results != test$STATISTICAL_MURDER_FLAG)
+print(paste('Accuracy',1-misClasificError))
+```
+
+76% accurate isn't too bad!
+
+However this is a bit misleading! Below shows that all the binary results are 0! 
+```{r}
+summary(binarized_results)
+
+```
+
+Lets look at a distribution of the probabilities to learn more.
+
+```{r}
+hist(fitted.results)
+
+```
+
+Lets find the median and use that to binarize our probabilities on.
+
+```{r}
+summary(fitted.results)
+```
+
+```{r}
+binarized_results <- ifelse(fitted.results > 0.2115,1,0)
+misClasificError <- mean(binarized_results != test$STATISTICAL_MURDER_FLAG)
+print(paste('Accuracy',1-misClasificError))
+
+```
+
+Unsurprisingly the Accuracy goes down as we increase the number of positive predictions in a low prevalence response. Accuracy is just one metric. If I were to continue this project, I would want to look at precision, recall, and ROC AUC. However I feel that is out of the scope of this project.
+
+### Conclusion:
+
+This was an interesting project. I probably would have never worked with data about shooting incidents if it weren't for this exercise. For whatever reason I was initially drawn to the STATISTICAL_MURDER_FLAG as an interesting data element in the data set and thus most of my analysis was centered about it. 
+
+The fact that I choose to focus on this data element might be a source of bias for my project. People who read my analysis might conclude that Brooklyn has the most gun related crime. This may or may not be true, but from just my analysis it is unknown. We have no information about the population size of these cities and thus no understanding of the crime rate relative to population.
+
+My first two graphs only focus on incidents that ended in murder, but I never compared the murder cases to the total cases from that city. This could be another source of bias in my analysis. 
+
+One last thing I noticed about the data set is that often the column about the perpetrator are null. If someone did anlysis on these columns, that would surely be a source of bias as so much of this data is not reported. This is why I decided to stay away from these columns in my analysis.
+
+
+
+
+```{r}
+#Session info for reproducibility
+sessionInfo()
+```
